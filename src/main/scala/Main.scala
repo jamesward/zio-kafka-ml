@@ -8,6 +8,8 @@ import zio._
 import zio.duration._
 import zio.kafka.client.serde.Serde
 import zio.kafka.client.{Consumer, ConsumerSettings, OffsetBatch, Producer, ProducerSettings, Subscription}
+import upickle.default._
+import ujson.Value
 
 object Main extends App {
 
@@ -48,9 +50,60 @@ object Main extends App {
     AsyncHttpClientZioBackend().flatMap { implicit sttpBackend =>
       (Consumer.make(consumerSettings) zip Producer.make(producerSettings, Serde.string, Serde.string)).use { case (consumer, producer) =>
         consumer.subscribeAnd(subscription).plainStream(Serde.string, Serde.string).mapM { record =>
-          basicRequest.post(config.mlUrl).body(record.record.value()).contentType(MediaType.ApplicationJson).send().flatMap { response =>
+          /*
+          ML Service must receive:
+          {
+            "instances": [
+              {
+                "end_station_id": "333",
+                "ts": 1435774380.0,
+                "day_of_week": "4",
+                "start_station_id": "160",
+                "euclidean": 4295.88,
+                "loc_cross": "POINT(-0.13 51.51)POINT(-0.19 51.51)",
+                "prcp": 0.0,
+                "max": 94.5,
+                "min": 58.9,
+                "temp": 81.8,
+                "dewp": 59.5
+              }
+            ]
+          }
+           */
+
+          val in = ujson.read(record.record.value())
+
+          val toMl = ujson.Obj(
+            "instances" -> ujson.Arr(
+              ujson.Obj(
+                "end_station_id" -> in("end_station_id"),
+                "ts" -> in("ts"),
+                "day_of_week" -> in("day_of_week"),
+                "start_station_id" -> in("start_station_id"),
+                "euclidean" -> in("euclidean"),
+                "loc_cross" -> in("loc_cross"),
+                "prcp" -> in("prcp"),
+                "max" -> in("max"),
+                "min" -> in("min"),
+                "temp" -> in("temp"),
+                "dewp" -> in("dewp"),
+              )
+            )
+          )
+
+          basicRequest.post(config.mlUrl).body(toMl.toString()).contentType(MediaType.ApplicationJson).send().flatMap { response =>
             ZIO.fromEither(response.body).map { body =>
-              val producerRecord = new ProducerRecord(config.kafkaTopicOut, record.record.key, body)
+
+              val fromMl = ujson.read(body)
+              /*
+              {
+                "predictions": [[1501.77026]]
+              }
+               */
+
+              in.update("prediction", fromMl("predictions")(0)(0).num)
+
+              val producerRecord = new ProducerRecord(config.kafkaTopicOut, record.record.key, in.toString())
               (producerRecord, record.offset)
             }
           }
