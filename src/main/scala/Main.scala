@@ -8,8 +8,6 @@ import zio._
 import zio.duration._
 import zio.kafka.client.serde.Serde
 import zio.kafka.client.{Consumer, ConsumerSettings, OffsetBatch, Producer, ProducerSettings, Subscription}
-import upickle.default._
-import ujson.Value
 
 object Main extends App {
 
@@ -47,6 +45,7 @@ object Main extends App {
 
     val subscription = Subscription.topics(config.kafkaTopicIn)
 
+    // todo: seekToEnd
     AsyncHttpClientZioBackend().flatMap { implicit sttpBackend =>
       (Consumer.make(consumerSettings) zip Producer.make(producerSettings, Serde.string, Serde.string)).use { case (consumer, producer) =>
         consumer.subscribeAnd(subscription).plainStream(Serde.string, Serde.string).mapM { record =>
