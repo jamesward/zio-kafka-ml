@@ -14,7 +14,6 @@ import zio.kafka.client.{CommittableRecord, Consumer, ConsumerSettings, Offset, 
 
 case class Config(bootstrapServer: String, kafkaTopicIn: String, kafkaTopicOut: String, mlUrl: Uri)
 
-
 object Main extends App {
   /** This is the type of chunk we'll be writing to Kafka. */
   type MyChunk = (org.apache.kafka.clients.producer.ProducerRecord[String,String], zio.kafka.client.Offset)
@@ -57,16 +56,22 @@ object Main extends App {
     )
 
     val subscription = Subscription.topics(config.kafkaTopicIn)
+    // Constructs the ML component in the ZIO environment.  We can use this to "provideSomeM" away our dependencies
+    // in the chain.
+    val makeMlService = 
+      for {
+        env <- ZIO.environment[ZEnv]
+        result <- ML.default(config.mlUrl)(env)
+      } yield result
 
     // todo: seekToEnd
-    AsyncHttpClientZioBackend().flatMap { implicit sttpBackend =>
-      (Consumer.make(consumerSettings) zip Producer.make(producerSettings, Serde.string, Serde.string)).use { 
-        case (consumer, producer) =>
-          consumer.subscribeAnd(subscription).plainStream(Serde.string, Serde.string)
-          .mapM(handleInputRecord(config, sttpBackend))
-          .chunks.mapM(commitChunk(producer))
-          .runDrain
-      }
+    (Consumer.make(consumerSettings) zip Producer.make(producerSettings, Serde.string, Serde.string)).use { 
+      case (consumer, producer) =>
+        consumer.subscribeAnd(subscription).plainStream(Serde.string, Serde.string)
+        .mapM(handleInputRecord(config))
+        .provideSomeM(makeMlService)
+        .chunks.mapM(commitChunk(producer))
+        .runDrain
     }
   }
 
@@ -77,9 +82,8 @@ object Main extends App {
     producer.produceChunk(records) *> offsetBatch.commit
   }
 
-  /** This function takes an incoming Kafka Consumer record and creates a ProducerRecord (at the same offset) that will write the ML result to that record. */
-  def handleInputRecord(config: Config, backend: sttp.client.SttpBackend[zio.Task,Nothing,sttp.client.asynchttpclient.WebSocketHandler])(
-    record: CommittableRecord[String,String]): ZIO[Any, Any, MyChunk] = {
+  /** This function takes a record from kafka and updates it with ML results. */
+  def handleInputRecord(config: Config)(record: CommittableRecord[String, String]): ZIO[ZEnv with ML, Throwable, MyChunk] = {
     /*
       ML Service must receive:
       {
@@ -88,7 +92,7 @@ object Main extends App {
             "end_station_id": "333",
             "ts": 1435774380.0,
             "day_of_week": "4",
-            "start_station_id": "160",
+            "start_stujsonation_id": "160",
             "euclidean": 4295.88,
             "loc_cross": "POINT(-0.13 51.51)POINT(-0.19 51.51)",
             "prcp": 0.0,
@@ -99,11 +103,10 @@ object Main extends App {
           }
         ]
       }
-        */
+    */
 
     val in = ujson.read(record.record.value())
-
-    val toMl = ujson.Obj(
+    val mlRequest = ujson.Obj(
       "instances" -> ujson.Arr(
         ujson.Obj(
           "end_station_id" -> in("end_station_id"),
@@ -120,31 +123,13 @@ object Main extends App {
         )
       )
     )
-
     for {
-      response <-  basicRequest.post(config.mlUrl).body(toMl.toString()).contentType(MediaType.ApplicationJson).send()(backend, implicitly)
-      chunk <- handleMlResponse(config.kafkaTopicOut, record.record.key, in, record.offset)(response)
-    } yield chunk
-  }
-
-
-  /* Take the respnse from calling the ML service and create a new Kafka record for it. */
-  def handleMlResponse(kafkaTopicOut: String, 
-                       recordKey: String,
-                       mlJson: ujson.Value.Value,
-                       offset: Offset)(response: Response[Either[String,String]]): ZIO[Any, String, MyChunk] =
-    ZIO.fromEither(response.body).map { body =>
-
-      val fromMl = ujson.read(body)
-      /*
-      {
-        "predictions": [[1501.77026]]
-      }
-       */
-
-       mlJson.update("prediction", fromMl("predictions")(0)(0).num)
-
-      val producerRecord = new ProducerRecord(kafkaTopicOut, recordKey, mlJson.toString())
-      (producerRecord, offset)
+      resp <- ML.send(mlRequest)
+    } yield {
+      // Update the incoming kafka record with preductions, then create a Chunk update with that value.
+      in.update("prediction", resp("predictions")(0)(0).num)
+      val producerRecord = new ProducerRecord(config.kafkaTopicOut, record.record.key, in.toString())
+      (producerRecord, record.offset)
     }
+  }
 }
