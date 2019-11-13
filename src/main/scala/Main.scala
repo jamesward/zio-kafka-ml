@@ -22,22 +22,23 @@ object Main extends App {
     wsToKafka.fold(_ => 1, _ => 0)
   }
 
-  val config: ZIO[System, Any, Config] = for {
-    bootstrapServer <- system.env("BOOTSTRAP_SERVER").someOrFail()
-    kafkaTopicIn <- system.env("KAFKA_TOPIC_IN").someOrFail()
-    kafkaTopicOut <- system.env("KAFKA_TOPIC_OUT").someOrFail()
-    mlUrl <- system.env("ML_URL").someOrFail().flatMap { mlUri => ZIO.fromTry(Uri.parse(mlUri)) }
+  val config: ZIO[System, Throwable, Config] = for {
+    bootstrapServer <- system.env("BOOTSTRAP_SERVER").someOrFail(new IllegalArgumentException("Could not find bootstrap server config."))
+    kafkaTopicIn <- system.env("KAFKA_TOPIC_IN").someOrFail(new IllegalArgumentException("Could not find kafka input topic."))
+    kafkaTopicOut <- system.env("KAFKA_TOPIC_OUT").someOrFail(new IllegalArgumentException("Could not find kafka output topic."))
+    rawUri <- system.env("ML_URL").someOrFail(new IllegalArgumentException("Could not find URL for ML server."))
+    mlUrl <- ZIO.fromTry(Uri.parse(rawUri))
   } yield Config(bootstrapServer, kafkaTopicIn, kafkaTopicOut, mlUrl)
 
   // todo: exit doesn't work
-  val wsToKafka: ZIO[ZEnv, Any, Unit] = 
+  val wsToKafka: ZIO[ZEnv, Throwable, Unit] = 
     for {
       c <- config
       result <- runMlService(c)
     } yield result
 
   /** Given config, this will open Kafka channels and handle events, firing requests to the ML service and updated the queue. */
-  def runMlService(config: Config): ZIO[ZEnv, Any, Unit] = {
+  def runMlService(config: Config): ZIO[ZEnv, Throwable, Unit] = {
     val producerSettings = ProducerSettings(
       bootstrapServers = List(config.bootstrapServer),
       closeTimeout = 30.seconds,
@@ -58,7 +59,7 @@ object Main extends App {
     val subscription = Subscription.topics(config.kafkaTopicIn)
     // Constructs the ML component in the ZIO environment.  We can use this to "provideSomeM" away our dependencies
     // in the chain.
-    val makeMlService = 
+    val makeMlService: ZIO[ZEnv, Throwable, ZEnv with ML] = 
       for {
         env <- ZIO.environment[ZEnv]
         result <- ML.default(config.mlUrl)(env)
@@ -67,16 +68,21 @@ object Main extends App {
     // todo: seekToEnd
     (Consumer.make(consumerSettings) zip Producer.make(producerSettings, Serde.string, Serde.string)).use { 
       case (consumer, producer) =>
+        //  A stream of string->string records
         consumer.subscribeAnd(subscription).plainStream(Serde.string, Serde.string)
+        // Send each record through our business logic
         .mapM(handleInputRecord(config))
+        // Provide the ML Service to run the business logic. (As we did not have the ML module)
         .provideSomeM(makeMlService)
+        // Peel of chunks and commit them into kafka
         .chunks.mapM(commitChunk(producer))
+        // Drain the entire queue
         .runDrain
     }
   }
 
   /** This takes a chunk and sets it for commit. */
-  def commitChunk[Env](producer: Producer[Env, String, String])(chunk: zio.Chunk[MyChunk]): ZIO[Env with Blocking, Any, Unit] = {
+  def commitChunk[Env](producer: Producer[Env, String, String])(chunk: zio.Chunk[MyChunk]): ZIO[Env with Blocking, Throwable, Unit] = {
     val records = chunk.map(_._1)
     val offsetBatch = OffsetBatch(chunk.map(_._2).toSeq)
     producer.produceChunk(records) *> offsetBatch.commit
